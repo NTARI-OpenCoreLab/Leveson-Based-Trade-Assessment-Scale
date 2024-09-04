@@ -30,9 +30,7 @@ Interaction fulfills a basic promise requiring little to no discipline toward us
 No Trust
 User was harmed, exploited, or received a product or service with evidence of no discipline or malicious intent
 
-
 Though not a two-way communication system on its own, assessments may be levied against both consumer and producer in a digital human-based computation network/mass production network; identifying bad actors on both sides of transactions for future users. For example, a network may maintain average ratings for producers to identify unskilled providers, and a consumer rating to identify exploitative or difficult customers.
-
 
 This program was produced by the Network Theory Applied Research Institute's Forge Laboratory by Jodson B. Graves using ChatGPT3 on September 4, 2024. Learn more and support Forge Laboratory at https://ntari.org/support
 
