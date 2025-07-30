@@ -1,0 +1,20 @@
+# Core dependencies for LBTAS
+# No external dependencies required for basic functionality
+
+# Optional dependencies for enhanced features
+# Install with: pip install lbtas[api] or pip install lbtas[all]
+
+# For API server functionality (optional)
+# flask>=2.0.0
+# fastapi>=0.70.0
+# uvicorn[standard]>=0.15.0
+
+# For database storage (optional)  
+# sqlalchemy>=1.4.0
+
+# For development (optional)
+# pytest>=6.0.0
+# pytest-cov>=2.12.0
+# flake8>=3.9.0
+# black>=21.0.0
+# mypy>=0.910
