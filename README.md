@@ -262,4 +262,4 @@ The AGPL-3.0 license requires that:
 ---
 
 **Maintained by**: [NTARI Research & Development](https://ntari.org)  
-**Questions?** Open an issue or contact us at forge@ntari.org
+**Questions?** Open an issue or contact us at info@ntari.org
