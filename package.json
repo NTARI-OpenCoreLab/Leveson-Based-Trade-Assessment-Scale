@@ -1,0 +1,35 @@
+{
+  "name": "lbtas",
+  "version": "1.0.0",
+  "description": "Leveson-Based Trade Assessment Scale - A rating system for digital commerce",
+  "main": "lbtas.js",
+  "types": "lbtas.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node lbtas.js",
+    "rate": "node lbtas.js rate",
+    "list": "node lbtas.js list",
+    "report": "node lbtas.js report"
+  },
+  "keywords": [
+    "rating",
+    "assessment",
+    "leveson",
+    "digital-commerce",
+    "ntari"
+  ],
+  "author": "Network Theory Applied Research Institute",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NTARI-OpenCoreLab/Leveson-Based-Trade-Assessment-Scale"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
