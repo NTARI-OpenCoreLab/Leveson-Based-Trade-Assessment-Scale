@@ -5,8 +5,15 @@ LBTAS API — entry point
 
 Minimal FastAPI app. This is the starting scaffold for the networked API
 described in CLAUDE.md ("What the API does"). POST /ratings runs a submission
-through the -1 comment validation rule; it does not yet persist anything —
-the event store lands separately.
+through the -1 comment validation rule and persists it; GET /ratings/{rated_party}
+reads back a distribution (never an average) plus first/last rated timestamps
+and a transaction count, per CLAUDE.md's "Reading and reporting reputation"
+and "data model" sections.
+
+Events persist to a local SQLite file (api/event_store.py) so ratings survive
+a restart, per CLAUDE.md's "Storing ratings locally" requirement. There is no
+authorization layer yet — that, and running this on NTARIHQ, are separate,
+not-yet-built pieces.
 
 Copyright (C) 2024 Network Theory Applied Research Institute
 Licensed under GNU Affero General Public License v3.0
@@ -17,11 +24,13 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from api import event_store
 from api.rating_validation import RatingValidationError, validate_rating_submission
 
 app = FastAPI(title="LBTAS API", version="2.0.0")
@@ -38,6 +47,10 @@ class RatingSubmission(BaseModel):
     )
 
 
+def _new_distribution() -> dict:
+    return {str(level): 0 for level in (-1, 0, 1, 2, 3, 4)}
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -50,4 +63,50 @@ def submit_rating(submission: RatingSubmission) -> dict:
     except RatingValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return {"status": "accepted", "submission": submission.model_dump()}
+    event = submission.model_dump()
+    event["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    conn = event_store.get_connection()
+    try:
+        event_store.insert_event(
+            conn,
+            exchange_id=event["exchange_id"],
+            rater=event["rater"],
+            rated_party=event["rated_party"],
+            category=event["category"],
+            value=event["value"],
+            comment=event["comment"],
+            timestamp=event["timestamp"],
+        )
+    finally:
+        conn.close()
+
+    return {"status": "accepted", "submission": event}
+
+
+@app.get("/ratings/{rated_party}")
+def read_ratings(rated_party: str) -> dict:
+    conn = event_store.get_connection()
+    try:
+        rows = event_store.get_events_for_party(conn, rated_party)
+    finally:
+        conn.close()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No ratings found for '{rated_party}'")
+
+    distribution = _new_distribution()
+    for row in rows:
+        distribution[str(row["value"])] += 1
+
+    timestamps = [row["timestamp"] for row in rows]
+    exchange_ids = {row["exchange_id"] for row in rows}
+
+    return {
+        "rated_party": rated_party,
+        "distribution": distribution,
+        "total": len(rows),
+        "first_rated_at": min(timestamps),
+        "last_rated_at": max(timestamps),
+        "transaction_count": len(exchange_ids),
+    }
