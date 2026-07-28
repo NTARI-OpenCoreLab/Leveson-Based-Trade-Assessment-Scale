@@ -5,10 +5,11 @@ LBTAS API — entry point
 
 Minimal FastAPI app. This is the starting scaffold for the networked API
 described in CLAUDE.md ("What the API does"). POST /ratings runs a submission
-through the -1 comment validation rule and persists it; GET /ratings/{rated_party}
+through the -1 comment validation rule and persists it; GET /ratings/{rated_party}/{role}
 reads back a distribution (never an average) plus first/last rated timestamps
 and a transaction count, per CLAUDE.md's "Reading and reporting reputation"
-and "data model" sections.
+and "data model" sections. Reads are role-scoped per SPEC.md §3: a rating
+earned in one role must never contaminate another role's distribution.
 
 Events persist to a local SQLite file (api/event_store.py) so ratings survive
 a restart, per CLAUDE.md's "Storing ratings locally" requirement. There is no
@@ -40,6 +41,9 @@ class RatingSubmission(BaseModel):
     exchange_id: str = Field(..., description="Triggering exchange/transaction id")
     rater: str = Field(..., description="Party submitting the rating")
     rated_party: str = Field(..., description="Party being rated")
+    role: str = Field(
+        ..., description="Capacity the rated party acted in, e.g. 'market_seller', 'market_buyer' (SPEC.md §3)"
+    )
     category: Optional[str] = None
     value: int = Field(..., description="Rating value, -1 to +4")
     comment: Optional[str] = Field(
@@ -73,6 +77,7 @@ def submit_rating(submission: RatingSubmission) -> dict:
             exchange_id=event["exchange_id"],
             rater=event["rater"],
             rated_party=event["rated_party"],
+            role=event["role"],
             category=event["category"],
             value=event["value"],
             comment=event["comment"],
@@ -84,16 +89,20 @@ def submit_rating(submission: RatingSubmission) -> dict:
     return {"status": "accepted", "submission": event}
 
 
-@app.get("/ratings/{rated_party}")
-def read_ratings(rated_party: str) -> dict:
+@app.get("/ratings/{rated_party}/{role}")
+def read_ratings(rated_party: str, role: str) -> dict:
+    """Role-scoped read (SPEC.md §3): a -1 earned as e.g. market_seller must never
+    show up in, or be averaged into, the rated party's market_buyer distribution."""
     conn = event_store.get_connection()
     try:
-        rows = event_store.get_events_for_party(conn, rated_party)
+        rows = event_store.get_events_for_party_role(conn, rated_party, role)
     finally:
         conn.close()
 
     if not rows:
-        raise HTTPException(status_code=404, detail=f"No ratings found for '{rated_party}'")
+        raise HTTPException(
+            status_code=404, detail=f"No ratings found for '{rated_party}' in role '{role}'"
+        )
 
     distribution = _new_distribution()
     for row in rows:
@@ -104,6 +113,7 @@ def read_ratings(rated_party: str) -> dict:
 
     return {
         "rated_party": rated_party,
+        "role": role,
         "distribution": distribution,
         "total": len(rows),
         "first_rated_at": min(timestamps),

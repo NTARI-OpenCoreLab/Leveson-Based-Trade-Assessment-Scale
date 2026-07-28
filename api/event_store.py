@@ -39,6 +39,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
             exchange_id TEXT NOT NULL,
             rater TEXT NOT NULL,
             rated_party TEXT NOT NULL,
+            role TEXT NOT NULL,
             category TEXT,
             value INTEGER NOT NULL,
             comment TEXT,
@@ -54,6 +55,7 @@ def insert_event(
     exchange_id: str,
     rater: str,
     rated_party: str,
+    role: str,
     category: Optional[str],
     value: int,
     comment: Optional[str],
@@ -61,17 +63,19 @@ def insert_event(
 ) -> None:
     conn.execute(
         """
-        INSERT INTO rating_events (exchange_id, rater, rated_party, category, value, comment, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO rating_events (exchange_id, rater, rated_party, role, category, value, comment, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (exchange_id, rater, rated_party, category, value, comment, timestamp),
+        (exchange_id, rater, rated_party, role, category, value, comment, timestamp),
     )
     conn.commit()
 
 
-def get_events_for_party(conn: sqlite3.Connection, rated_party: str) -> list[sqlite3.Row]:
+def get_events_for_party_role(conn: sqlite3.Connection, rated_party: str, role: str) -> list[sqlite3.Row]:
+    """Events for a rated party, scoped to a single role (SPEC.md §3): a -1 earned
+    in one role must never contaminate the distribution of another role."""
     cursor = conn.execute(
-        "SELECT * FROM rating_events WHERE rated_party = ? ORDER BY timestamp",
-        (rated_party,),
+        "SELECT * FROM rating_events WHERE rated_party = ? AND role = ? ORDER BY timestamp",
+        (rated_party, role),
     )
     return cursor.fetchall()
