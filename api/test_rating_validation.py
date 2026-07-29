@@ -11,6 +11,7 @@ Licensed under GNU Affero General Public License v3.0
 import sys
 
 from rating_validation import (
+    MAX_COMMENT_BYTES,
     MAX_COMMENT_WORDS,
     RatingValidationError,
     validate_rating_submission,
@@ -58,6 +59,15 @@ def run():
     # as no exception at all, which the expect_error helper would catch).
     over_limit = " ".join(["word"] * (MAX_COMMENT_WORDS + 1))
     expect_error(-1, over_limit, "minus_one_over_limit", must_contain="500 words or fewer")
+
+    # -1 with <=500 "words" that are individually huge still gets rejected on
+    # size: a word-count cap alone doesn't bound bytes.
+    huge_words = " ".join(["x" * 100] * MAX_COMMENT_WORDS)  # 500 words, way over the byte cap
+    expect_error(-1, huge_words, "minus_one_huge_words_over_byte_cap", must_contain="bytes or fewer")
+
+    # -1 right at the byte ceiling (single word, ASCII) passes.
+    at_byte_cap = "x" * MAX_COMMENT_BYTES
+    expect_ok(-1, at_byte_cap, "minus_one_exactly_at_byte_cap")
 
     # Ratings 0..+4: comment is optional.
     for level in (0, 1, 2, 3, 4):

@@ -12,6 +12,9 @@ requirement"):
     blank/whitespace-only one) is rejected.
   - The 500-word maximum is enforced by rejecting the submission outright,
     never by silently truncating it.
+  - A word count alone doesn't bound size (500 arbitrarily long "words" would
+    still pass), so a generous byte ceiling (MAX_COMMENT_BYTES) backs it up,
+    also enforced by rejection.
   - For ratings 0 through +4, a comment is optional and unbounded here
     (product requirements may add limits later, but CLAUDE.md does not
     impose one on those levels).
@@ -37,6 +40,10 @@ MIN_RATING = -1
 MAX_RATING = 4
 HARM_RATING = -1
 MAX_COMMENT_WORDS = 500
+# A word-count cap alone doesn't bound size (500 arbitrarily long "words" is
+# legal by that rule alone). This is a generous byte ceiling well above any
+# legitimate 500-word comment, meant only to catch that pathological case.
+MAX_COMMENT_BYTES = 10_000
 
 
 class RatingValidationError(ValueError):
@@ -81,6 +88,13 @@ def validate_rating_submission(value: int, comment: Optional[str] = None) -> Non
             raise RatingValidationError(
                 f"Comment for a -1 (No Trust) rating must be {MAX_COMMENT_WORDS} words or "
                 f"fewer; got {word_count}. Submission rejected, not truncated."
+            )
+
+        comment_bytes = len(comment.encode("utf-8"))
+        if comment_bytes > MAX_COMMENT_BYTES:
+            raise RatingValidationError(
+                f"Comment for a -1 (No Trust) rating must be {MAX_COMMENT_BYTES} bytes or "
+                f"fewer; got {comment_bytes}. Submission rejected, not truncated."
             )
 
     # Ratings 0..+4: comment is optional and unbounded here; nothing to enforce.

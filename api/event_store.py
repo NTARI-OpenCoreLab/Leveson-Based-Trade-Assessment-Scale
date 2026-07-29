@@ -18,10 +18,23 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
 
+import os
 import sqlite3
 from typing import Optional
 
-DEFAULT_DB_PATH = "lbtas_events.db"
+# CWD-relative paths make the DB location depend on where uvicorn is started
+# from; an absolute default removes that ambiguity. Still overridable via env.
+DEFAULT_DB_PATH = os.environ.get(
+    "LBTAS_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lbtas_events.db")
+)
+
+
+class DuplicateRatingError(Exception):
+    """Raised when (exchange_id, rater, rated_party) has already been submitted.
+
+    One rating per direction per exchange (CLAUDE.md's data model treats the
+    count itself as a trust signal, so repeat submissions must not inflate it).
+    """
 
 
 def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -41,11 +54,15 @@ def _init_db(conn: sqlite3.Connection) -> None:
             rated_party TEXT NOT NULL,
             role TEXT NOT NULL,
             category TEXT,
-            value INTEGER NOT NULL,
+            value INTEGER NOT NULL CHECK (value BETWEEN -1 AND 4),
             comment TEXT,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            UNIQUE (exchange_id, rater, rated_party)
         )
         """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rating_events_party_role ON rating_events (rated_party, role)"
     )
     conn.commit()
 
@@ -61,14 +78,21 @@ def insert_event(
     comment: Optional[str],
     timestamp: str,
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO rating_events (exchange_id, rater, rated_party, role, category, value, comment, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (exchange_id, rater, rated_party, role, category, value, comment, timestamp),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            """
+            INSERT INTO rating_events (exchange_id, rater, rated_party, role, category, value, comment, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (exchange_id, rater, rated_party, role, category, value, comment, timestamp),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint failed" in str(e):
+            raise DuplicateRatingError(
+                f"A rating from '{rater}' for '{rated_party}' on exchange '{exchange_id}' already exists."
+            ) from e
+        raise
 
 
 def get_events_for_party_role(conn: sqlite3.Connection, rated_party: str, role: str) -> list[sqlite3.Row]:

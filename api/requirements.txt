@@ -1,0 +1,15 @@
+# LBTAS API dependencies
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+
+# Run the app from the REPO ROOT, so the `api` package resolves for its
+# relative imports:
+#   uvicorn api.main:app --reload
+#
+# Run the tests from INSIDE this directory (they use bare imports):
+#   cd api && python3 test_rating_validation.py
+#   cd api && python3 test_event_store.py
+#
+# Reads require an API key (fails closed otherwise):
+#   LBTAS_API_KEY=<your-key> uvicorn api.main:app --reload
+#   curl -H "X-API-Key: <your-key>" http://localhost:8000/ratings/<party>/<role>
