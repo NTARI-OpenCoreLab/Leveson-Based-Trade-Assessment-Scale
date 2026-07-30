@@ -1,0 +1,54 @@
+name: CodeQL
+# Replaces CodeQL default setup, which never analyzes pull requests from
+# forks — leaving contributor PRs permanently blocked by the
+# "Require code scanning - main" ruleset (see PR #7).
+#
+# SAFETY: this runs on pull_request (NOT pull_request_target), so fork PRs
+# execute with a read-only token and no secrets. build-mode: none means
+# analysis never executes repository code; Go is the exception (CodeQL
+# requires a build for Go) and uses autobuild, which compiles but does not
+# run the code. Keep it that way — do not add manual build/test steps or
+# switch the trigger to pull_request_target.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 9 * * 1'   # weekly Monday, matching default setup's cadence
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same five languages default setup covered, default query suite.
+        include:
+          - language: actions
+            build-mode: none
+          - language: go
+            build-mode: autobuild   # Go does not support build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38   # v4.37.4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38   # v4.37.4
+        with:
+          category: "/language:${{ matrix.language }}"
