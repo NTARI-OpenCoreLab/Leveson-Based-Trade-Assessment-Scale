@@ -23,6 +23,23 @@ capabilities, and only the read side was flagged as unauthorized in review;
 gating submission is a separate, not-yet-built piece. Running this on
 NTARIHQ is likewise separate.
 
+POST /ratings/{event_id}/dismiss lets an adjudicator dismiss a bad-faith
+rating (SPEC.md §4, §6): the dismissal is its own append-only annotation,
+never an edit or delete of the original event. GET /ratings/{party}/{role}
+computes its distribution from active (non-dismissed) events only, but
+always surfaces every dismissed event alongside it, with who dismissed it
+and why — dismissal forgives, it does not hide. There is no distinct
+adjudicator identity yet; dismissal is gated behind the same LBTAS_API_KEY
+as reads, which is coarser than SPEC.md's "operator-local adjudicator role."
+
+POST /ratings/{event_id}/contest lets the rated party dispute a rating made
+against them, in either direction (SPEC.md §5 — the covenant is symmetric,
+no privileged side); it is ungated, like POST /ratings, since it's the rated
+party exercising their own right rather than a privileged review. POST
+/ratings/{event_id}/uphold is the adjudicator's other resolution besides
+dismissal: the rating stands, but GET marks it "contested" and "upheld" (with
+who and why) rather than silently leaving it looking unquestioned.
+
 Copyright (C) 2024 Network Theory Applied Research Institute
 Licensed under GNU Affero General Public License v3.0
 
@@ -86,6 +103,21 @@ class RatingSubmission(BaseModel):
     )
 
 
+class DismissalRequest(BaseModel):
+    dismissed_by: str = Field(..., min_length=1, description="The adjudicator dismissing this rating")
+    reason: str = Field(..., min_length=1, description="Why the rating is bad-faith / being dismissed")
+
+
+class ContestRequest(BaseModel):
+    contested_by: str = Field(..., min_length=1, description="The rated party contesting this rating")
+    reason: str = Field(..., min_length=1, description="Why the rating is being disputed")
+
+
+class UpholdRequest(BaseModel):
+    upheld_by: str = Field(..., min_length=1, description="The adjudicator upholding this rating")
+    reason: str = Field(..., min_length=1, description="Why the contest was rejected and the rating stands")
+
+
 def _new_distribution() -> dict:
     return {str(level): 0 for level in (-1, 0, 1, 2, 3, 4)}
 
@@ -126,34 +158,191 @@ def submit_rating(submission: RatingSubmission) -> dict:
     return {"status": "accepted", "submission": event}
 
 
-@app.get("/ratings/{rated_party}/{role}", dependencies=[Depends(require_api_key)])
-def read_ratings(rated_party: str, role: str) -> dict:
-    """Role-scoped read (SPEC.md §3): a -1 earned as e.g. market_seller must never
-    show up in, or be averaged into, the rated party's market_buyer distribution."""
+@app.post("/ratings/{event_id}/dismiss", dependencies=[Depends(require_api_key)])
+def dismiss_rating(event_id: int, dismissal: DismissalRequest) -> dict:
+    """Adjudicator dismissal (SPEC.md §4, §6): annotates, never erases. Removes
+    the event from the active distribution on read, but the event and this
+    annotation both stay permanently visible via GET's "dismissed" list."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+
     conn = event_store.get_connection()
     try:
-        rows = event_store.get_events_for_party_role(conn, rated_party, role)
+        event_store.dismiss_event(
+            conn,
+            event_id=event_id,
+            dismissed_by=dismissal.dismissed_by,
+            reason=dismissal.reason,
+            timestamp=timestamp,
+        )
+    except event_store.EventNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except event_store.AlreadyDismissedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     finally:
         conn.close()
 
-    if not rows:
+    return {
+        "status": "dismissed",
+        "event_id": event_id,
+        "dismissed_by": dismissal.dismissed_by,
+        "reason": dismissal.reason,
+        "timestamp": timestamp,
+    }
+
+
+@app.post("/ratings/{event_id}/contest")
+def contest_rating(event_id: int, contest: ContestRequest) -> dict:
+    """The rated party disputes a rating made against them (SPEC.md §5).
+    Ungated, unlike dismiss/uphold: this is the rated party's own right, not
+    an adjudicator action — same posture as POST /ratings, which is also not
+    yet gated behind per-party auth."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    conn = event_store.get_connection()
+    try:
+        event_store.contest_event(
+            conn,
+            event_id=event_id,
+            contested_by=contest.contested_by,
+            reason=contest.reason,
+            timestamp=timestamp,
+        )
+    except event_store.EventNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (event_store.AlreadyDismissedError, event_store.AlreadyContestedError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    finally:
+        conn.close()
+
+    return {
+        "status": "contested",
+        "event_id": event_id,
+        "contested_by": contest.contested_by,
+        "reason": contest.reason,
+        "timestamp": timestamp,
+    }
+
+
+@app.post("/ratings/{event_id}/uphold", dependencies=[Depends(require_api_key)])
+def uphold_rating(event_id: int, uphold: UpholdRequest) -> dict:
+    """Adjudicator resolution: the contest is rejected and the rating stands
+    (SPEC.md §6). Requires an existing contest on this event (404 if none);
+    GET then marks the event "contested" and "upheld" rather than letting it
+    look unquestioned."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    conn = event_store.get_connection()
+    try:
+        event_store.uphold_contest(
+            conn,
+            event_id=event_id,
+            upheld_by=uphold.upheld_by,
+            reason=uphold.reason,
+            timestamp=timestamp,
+        )
+    except event_store.ContestNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (event_store.AlreadyDismissedError, event_store.AlreadyUpheldError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    finally:
+        conn.close()
+
+    return {
+        "status": "upheld",
+        "event_id": event_id,
+        "upheld_by": uphold.upheld_by,
+        "reason": uphold.reason,
+        "timestamp": timestamp,
+    }
+
+
+@app.get("/ratings/{rated_party}/{role}", dependencies=[Depends(require_api_key)])
+def read_ratings(rated_party: str, role: str) -> dict:
+    """Role-scoped read (SPEC.md §3): a -1 earned as e.g. market_seller must never
+    show up in, or be averaged into, the rated party's market_buyer distribution.
+
+    The distribution/total/timestamps below reflect only active (non-dismissed)
+    events (SPEC.md §6). Dismissed events are never omitted from the response
+    entirely — they're always listed under "dismissed", annotated with who
+    dismissed them and why, even if that leaves no active events at all.
+    """
+    conn = event_store.get_connection()
+    try:
+        active_rows = event_store.get_events_for_party_role(conn, rated_party, role)
+        dismissed_rows = event_store.get_dismissed_events_for_party_role(conn, rated_party, role)
+    finally:
+        conn.close()
+
+    if not active_rows and not dismissed_rows:
         raise HTTPException(
             status_code=404, detail=f"No ratings found for '{rated_party}' in role '{role}'"
         )
 
     distribution = _new_distribution()
-    for row in rows:
+    for row in active_rows:
         distribution[str(row["value"])] += 1
 
-    timestamps = [row["timestamp"] for row in rows]
-    exchange_ids = {row["exchange_id"] for row in rows}
+    events = []
+    for row in active_rows:
+        event = {
+            "event_id": row["id"],
+            "value": row["value"],
+            "category": row["category"],
+            "comment": row["comment"],
+            "exchange_id": row["exchange_id"],
+            "rater": row["rater"],
+            "rated_at": row["timestamp"],
+            "contested": row["contested_by"] is not None,
+        }
+        if row["contested_by"] is not None:
+            event["contested_by"] = row["contested_by"]
+            event["contest_reason"] = row["contest_reason"]
+            event["contested_at"] = row["contested_at"]
+            event["upheld"] = row["upheld_by"] is not None
+            # SPEC.md §6: surface that a contested rating was upheld, not just
+            # that it was contested — a pending contest and a resolved one
+            # must not look the same.
+            if row["upheld_by"] is not None:
+                event["upheld_by"] = row["upheld_by"]
+                event["uphold_reason"] = row["uphold_reason"]
+                event["upheld_at"] = row["upheld_at"]
+        events.append(event)
 
-    return {
+    dismissed = [
+        {
+            "event_id": row["id"],
+            "value": row["value"],
+            "category": row["category"],
+            "comment": row["comment"],
+            "exchange_id": row["exchange_id"],
+            "rater": row["rater"],
+            "rated_at": row["timestamp"],
+            "dismissed_by": row["dismissed_by"],
+            "reason": row["dismissal_reason"],
+            "dismissed_at": row["dismissed_at"],
+        }
+        for row in dismissed_rows
+    ]
+
+    result = {
         "rated_party": rated_party,
         "role": role,
         "distribution": distribution,
-        "total": len(rows),
-        "first_rated_at": min(timestamps),
-        "last_rated_at": max(timestamps),
-        "transaction_count": len(exchange_ids),
+        "total": len(active_rows),
+        "events": events,
+        "dismissed_count": len(dismissed),
+        "dismissed": dismissed,
     }
+
+    if active_rows:
+        timestamps = [row["timestamp"] for row in active_rows]
+        exchange_ids = {row["exchange_id"] for row in active_rows}
+        result["first_rated_at"] = min(timestamps)
+        result["last_rated_at"] = max(timestamps)
+        result["transaction_count"] = len(exchange_ids)
+    else:
+        result["first_rated_at"] = None
+        result["last_rated_at"] = None
+        result["transaction_count"] = 0
+
+    return result
