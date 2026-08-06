@@ -1,5 +1,7 @@
 # Contributing to LBTAS
 
+> 🌐 Also available in: [العربية](contributing.ar.md) · [Español](contributing.es.md) · [Français](contributing.fr.md) · [हिन्दी](contributing.hi.md) · [Português](contributing.pt.md) · [toki pona](contributing.tok.md) · [中文](contributing.zh.md) — community translation drafts per NTARI policy P2-002; this English original is authoritative.
+
 ## How to Contribute
 
 Contributions are made through the NTARI Slack workspace.

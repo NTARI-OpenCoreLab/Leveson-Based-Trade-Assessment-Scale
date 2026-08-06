@@ -1,5 +1,7 @@
 # Leveson-Based Trade Assessment Scale (LBTAS)
 
+> 🌐 Also available in: [العربية](README.ar.md) · [Español](README.es.md) · [Français](README.fr.md) · [हिन्दी](README.hi.md) · [Português](README.pt.md) · [toki pona](README.tok.md) · [中文](README.zh.md) — community translation drafts per NTARI policy P2-002; this English original is authoritative.
+
 A rating system for digital commerce based on Nancy Leveson's aircraft software assessment methodology with bidirectional assessment criteria.
 
 ## Overview
