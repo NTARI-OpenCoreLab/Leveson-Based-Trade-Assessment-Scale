@@ -9,6 +9,7 @@ Licensed under GNU Affero General Public License v3.0
 
 import sqlite3
 import sys
+from datetime import datetime
 
 from event_store import (
     AlreadyContestedError,
@@ -17,12 +18,17 @@ from event_store import (
     ContestNotFoundError,
     DuplicateRatingError,
     EventNotFoundError,
+    ExchangeAlreadyExistsError,
+    ExchangeNotFoundError,
+    TimeoutAlreadyAppliedError,
+    apply_timeout_defaults,
     contest_event,
     dismiss_event,
     get_connection,
     get_dismissed_events_for_party_role,
     get_events_for_party_role,
     insert_event,
+    register_exchange,
     uphold_contest,
 )
 
@@ -347,6 +353,144 @@ def run():
         AlreadyDismissedError,
         "uphold_dismissed_event_rejected",
     )
+
+    # --- Timeout defaults (SPEC.md §7) ---
+
+    # An exchange that completed well in the past, with a short window that
+    # has already elapsed by "now" below.
+    register_exchange(
+        conn,
+        exchange_id="tx-timeout-1",
+        completed_at="2026-01-01T00:00:00+00:00",
+        rating_window_seconds=60,
+        party_a="TimeoutSeller",
+        role_a="market_seller",
+        party_b="TimeoutBuyer",
+        role_b="market_buyer",
+    )
+
+    # Registering the same exchange_id twice is rejected.
+    expect_error(
+        lambda: register_exchange(
+            conn,
+            exchange_id="tx-timeout-1",
+            completed_at="2026-01-01T00:00:00+00:00",
+            rating_window_seconds=60,
+            party_a="TimeoutSeller",
+            role_a="market_seller",
+            party_b="TimeoutBuyer",
+            role_b="market_buyer",
+        ),
+        ExchangeAlreadyExistsError,
+        "duplicate_exchange_registration",
+    )
+
+    # Well past the window: both directions get backfilled with a
+    # system-attributed +2.
+    result = apply_timeout_defaults(conn, "tx-timeout-1", datetime.fromisoformat("2026-01-01T01:00:00+00:00"))
+    assert result["status"] == "processed"
+    assert sorted(result["defaulted"]) == ["TimeoutBuyer", "TimeoutSeller"]
+
+    seller_default_rows = get_events_for_party_role(conn, "TimeoutSeller", "market_seller")
+    assert len(seller_default_rows) == 1
+    assert seller_default_rows[0]["value"] == 2, "timeout default must be +2"
+    assert seller_default_rows[0]["rater"] == "system"
+    assert seller_default_rows[0]["rater_role"] == "system", "must be system-attributed, not a party rating"
+
+    buyer_default_rows = get_events_for_party_role(conn, "TimeoutBuyer", "market_buyer")
+    assert len(buyer_default_rows) == 1
+    assert buyer_default_rows[0]["rater_role"] == "system"
+
+    # Idempotent: calling again backfills nothing new, both directions
+    # already have a rating.
+    result_again = apply_timeout_defaults(
+        conn, "tx-timeout-1", datetime.fromisoformat("2026-01-01T02:00:00+00:00")
+    )
+    assert result_again["status"] == "processed"
+    assert result_again["defaulted"] == [], "already-rated directions must not be defaulted again"
+
+    # A late real rating for a direction that already has a timeout default
+    # is rejected outright — it would otherwise double-count that direction.
+    expect_error(
+        lambda: insert_event(
+            conn,
+            exchange_id="tx-timeout-1",
+            rater="TimeoutBuyer",
+            rated_party="TimeoutSeller",
+            role="market_seller",
+            category=None,
+            value=4,
+            comment=None,
+            timestamp="2026-01-01T03:00:00+00:00",
+            rater_role="party",
+        ),
+        TimeoutAlreadyAppliedError,
+        "late_rating_after_timeout_default_rejected",
+    )
+
+    # Applying timeouts on an unregistered exchange is rejected.
+    expect_error(
+        lambda: apply_timeout_defaults(conn, "no-such-exchange", datetime.fromisoformat("2026-01-01T00:00:00+00:00")),
+        ExchangeNotFoundError,
+        "apply_timeouts_unregistered_exchange",
+    )
+
+    # A second exchange: not yet due. "now" is right at completion, well
+    # before the (default) 7-day-equivalent-sized window below elapses.
+    register_exchange(
+        conn,
+        exchange_id="tx-timeout-2",
+        completed_at="2026-02-01T00:00:00+00:00",
+        rating_window_seconds=3600,
+        party_a="NotYetSeller",
+        role_a="market_seller",
+        party_b="NotYetBuyer",
+        role_b="market_buyer",
+    )
+    not_due_result = apply_timeout_defaults(
+        conn, "tx-timeout-2", datetime.fromisoformat("2026-02-01T00:30:00+00:00")
+    )
+    assert not_due_result["status"] == "not_due"
+    assert not_due_result["defaulted"] == []
+    assert get_events_for_party_role(conn, "NotYetSeller", "market_seller") == [], (
+        "nothing should be defaulted before the window elapses"
+    )
+
+    # A third exchange: one direction already rated for real before the
+    # window elapses, so only the OTHER direction should get defaulted.
+    register_exchange(
+        conn,
+        exchange_id="tx-timeout-3",
+        completed_at="2026-03-01T00:00:00+00:00",
+        rating_window_seconds=60,
+        party_a="PartialSeller",
+        role_a="market_seller",
+        party_b="PartialBuyer",
+        role_b="market_buyer",
+    )
+    # PartialBuyer rates PartialSeller for real, before the window is up.
+    insert_event(
+        conn,
+        exchange_id="tx-timeout-3",
+        rater="PartialBuyer",
+        rated_party="PartialSeller",
+        role="market_seller",
+        category=None,
+        value=4,
+        comment=None,
+        timestamp="2026-03-01T00:00:30+00:00",
+        rater_role="party",
+    )
+    partial_result = apply_timeout_defaults(
+        conn, "tx-timeout-3", datetime.fromisoformat("2026-03-01T01:00:00+00:00")
+    )
+    assert partial_result["defaulted"] == ["PartialBuyer"], (
+        f"only the unrated direction should default, got {partial_result['defaulted']}"
+    )
+    seller_rows_partial = get_events_for_party_role(conn, "PartialSeller", "market_seller")
+    assert len(seller_rows_partial) == 1
+    assert seller_rows_partial[0]["value"] == 4, "the real rating must stand, untouched by the timeout pass"
+    assert seller_rows_partial[0]["rater_role"] == "party"
 
     conn.close()
     print("ALL TESTS PASSED")

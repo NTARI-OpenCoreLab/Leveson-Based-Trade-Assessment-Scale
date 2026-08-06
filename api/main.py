@@ -40,6 +40,15 @@ party exercising their own right rather than a privileged review. POST
 dismissal: the rating stands, but GET marks it "contested" and "upheld" (with
 who and why) rather than silently leaving it looking unquestioned.
 
+POST /exchanges registers an exchange's two rating directions and starts its
+rating window (SPEC.md §7); ungated, same posture as POST /ratings. POST
+/exchanges/{exchange_id}/apply-timeouts backfills a system-attributed +2 for
+any direction still unrated once the window has elapsed — there's no
+background worker here, so a real deployment calls this from an external
+scheduler. It's gated behind LBTAS_API_KEY, same as dismiss/uphold. GET marks
+a timeout default as "defaulted" so it's never mistaken for an affirmed
+rating, and surfaces a party/role's defaulted_count.
+
 Copyright (C) 2024 Network Theory Applied Research Institute
 Licensed under GNU Affero General Public License v3.0
 
@@ -63,6 +72,7 @@ from .rating_validation import RatingValidationError, validate_rating_submission
 app = FastAPI(title="LBTAS API", version="2.0.0")
 
 API_KEY_ENV_VAR = "LBTAS_API_KEY"
+DEFAULT_RATING_WINDOW_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 
 def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
@@ -118,6 +128,20 @@ class UpholdRequest(BaseModel):
     reason: str = Field(..., min_length=1, description="Why the contest was rejected and the rating stands")
 
 
+class ExchangeRegistration(BaseModel):
+    exchange_id: str = Field(..., description="Unique id for this exchange")
+    party_a: str = Field(..., description="One party to the exchange")
+    role_a: str = Field(..., min_length=1, description="Capacity party_a acted in; party_b rates party_a on this")
+    party_b: str = Field(..., description="The other party to the exchange")
+    role_b: str = Field(..., min_length=1, description="Capacity party_b acted in; party_a rates party_b on this")
+    completed_at: Optional[str] = Field(
+        None, description="ISO-8601 completion time; defaults to now if omitted"
+    )
+    rating_window_seconds: Optional[int] = Field(
+        None, description=f"Rating window before a timeout default applies; defaults to {DEFAULT_RATING_WINDOW_SECONDS}s (7 days)"
+    )
+
+
 def _new_distribution() -> dict:
     return {str(level): 0 for level in (-1, 0, 1, 2, 3, 4)}
 
@@ -150,7 +174,7 @@ def submit_rating(submission: RatingSubmission) -> dict:
             comment=event["comment"],
             timestamp=event["timestamp"],
         )
-    except event_store.DuplicateRatingError as e:
+    except (event_store.DuplicateRatingError, event_store.TimeoutAlreadyAppliedError) as e:
         raise HTTPException(status_code=409, detail=str(e))
     finally:
         conn.close()
@@ -256,6 +280,59 @@ def uphold_rating(event_id: int, uphold: UpholdRequest) -> dict:
     }
 
 
+@app.post("/exchanges", status_code=201)
+def register_exchange(exchange: ExchangeRegistration) -> dict:
+    """Register an exchange's two rating directions and start its rating
+    window (SPEC.md §7). Ungated, same posture as POST /ratings."""
+    completed_at = exchange.completed_at or datetime.now(timezone.utc).isoformat()
+    rating_window_seconds = exchange.rating_window_seconds or DEFAULT_RATING_WINDOW_SECONDS
+
+    conn = event_store.get_connection()
+    try:
+        event_store.register_exchange(
+            conn,
+            exchange_id=exchange.exchange_id,
+            completed_at=completed_at,
+            rating_window_seconds=rating_window_seconds,
+            party_a=exchange.party_a,
+            role_a=exchange.role_a,
+            party_b=exchange.party_b,
+            role_b=exchange.role_b,
+        )
+    except event_store.ExchangeAlreadyExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    finally:
+        conn.close()
+
+    return {
+        "status": "registered",
+        "exchange_id": exchange.exchange_id,
+        "completed_at": completed_at,
+        "rating_window_seconds": rating_window_seconds,
+        "party_a": exchange.party_a,
+        "role_a": exchange.role_a,
+        "party_b": exchange.party_b,
+        "role_b": exchange.role_b,
+    }
+
+
+@app.post("/exchanges/{exchange_id}/apply-timeouts", dependencies=[Depends(require_api_key)])
+def apply_timeouts(exchange_id: str) -> dict:
+    """Backfill a system-attributed +2 (SPEC.md §7) for any direction of
+    this exchange still unrated once its rating window has elapsed.
+    Idempotent — safe to call repeatedly, e.g. from an external scheduler,
+    since this API has no background worker of its own."""
+    conn = event_store.get_connection()
+    try:
+        result = event_store.apply_timeout_defaults(conn, exchange_id, datetime.now(timezone.utc))
+    except event_store.ExchangeNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    finally:
+        conn.close()
+
+    return result
+
+
 @app.get("/ratings/{rated_party}/{role}", dependencies=[Depends(require_api_key)])
 def read_ratings(rated_party: str, role: str) -> dict:
     """Role-scoped read (SPEC.md §3): a -1 earned as e.g. market_seller must never
@@ -292,6 +369,9 @@ def read_ratings(rated_party: str, role: str) -> dict:
             "exchange_id": row["exchange_id"],
             "rater": row["rater"],
             "rated_at": row["timestamp"],
+            # SPEC.md §7: a timeout default MUST be distribution-distinguishable
+            # from an affirmed rating — never look like praise or like silence.
+            "defaulted": row["rater_role"] == "system",
             "contested": row["contested_by"] is not None,
         }
         if row["contested_by"] is not None:
@@ -324,12 +404,15 @@ def read_ratings(rated_party: str, role: str) -> dict:
         for row in dismissed_rows
     ]
 
+    defaulted_count = sum(1 for row in active_rows if row["rater_role"] == "system")
+
     result = {
         "rated_party": rated_party,
         "role": role,
         "distribution": distribution,
         "total": len(active_rows),
         "events": events,
+        "defaulted_count": defaulted_count,
         "dismissed_count": len(dismissed),
         "dismissed": dismissed,
     }

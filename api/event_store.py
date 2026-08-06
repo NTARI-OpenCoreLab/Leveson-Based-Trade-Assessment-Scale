@@ -20,6 +20,7 @@ the Free Software Foundation, either version 3 of the License, or
 
 import os
 import sqlite3
+from datetime import datetime, timedelta
 from typing import Optional
 
 # CWD-relative paths make the DB location depend on where uvicorn is started
@@ -27,6 +28,11 @@ from typing import Optional
 DEFAULT_DB_PATH = os.environ.get(
     "LBTAS_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lbtas_events.db")
 )
+
+# SPEC.md §7: +2 ("Basic Satisfaction") is the conservative timeout default
+# (it does not inflate reputation); +3 is the documented alternative. This is
+# the only tunable constant in the scale.
+TIMEOUT_DEFAULT_RATING = 2
 
 
 class DuplicateRatingError(Exception):
@@ -63,6 +69,27 @@ class AlreadyUpheldError(Exception):
     """Raised on a second uphold attempt against the same contest."""
 
 
+class ExchangeNotFoundError(Exception):
+    """Raised when apply_timeout_defaults targets an unregistered exchange_id."""
+
+
+class ExchangeAlreadyExistsError(Exception):
+    """Raised on registering an exchange_id that's already registered."""
+
+
+class TimeoutAlreadyAppliedError(Exception):
+    """Raised on a real rating submission for an (exchange_id, rated_party)
+    direction that already has a system-attributed timeout default.
+
+    SPEC.md §7 doesn't say what happens if a party rates late, after the
+    window already closed and a default was recorded — but allowing it would
+    silently double-count that direction (both the +2 default and the late
+    real rating would sit in the distribution together). Rejecting it keeps
+    one rating (real or default) per exchange per direction, consistent with
+    the DuplicateRatingError invariant everywhere else in this store.
+    """
+
+
 def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -83,6 +110,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
             value INTEGER NOT NULL CHECK (value BETWEEN -1 AND 4),
             comment TEXT,
             timestamp TEXT NOT NULL,
+            rater_role TEXT NOT NULL DEFAULT 'party' CHECK (rater_role IN ('party', 'system')),
             UNIQUE (exchange_id, rater, rated_party)
         )
         """
@@ -134,6 +162,23 @@ def _init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # SPEC.md §7: an exchange has two rating directions (party_a rates
+    # party_b in role_b, and party_b rates party_a in role_a). Registering
+    # one is what starts its rating window; apply_timeout_defaults checks
+    # this row to decide whether either direction is overdue.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exchanges (
+            exchange_id TEXT PRIMARY KEY,
+            completed_at TEXT NOT NULL,
+            rating_window_seconds INTEGER NOT NULL,
+            party_a TEXT NOT NULL,
+            role_a TEXT NOT NULL,
+            party_b TEXT NOT NULL,
+            role_b TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
 
 
@@ -147,14 +192,31 @@ def insert_event(
     value: int,
     comment: Optional[str],
     timestamp: str,
+    rater_role: str = "party",
 ) -> None:
+    # SPEC.md §7: a real ("party") rating arriving after a timeout default
+    # already filled this exact direction would double-count it (both the
+    # default and the late rating in the same distribution). The system's
+    # own default insert (rater_role="system") skips this check — it's the
+    # one thing allowed to occupy that slot when nothing else has.
+    if rater_role == "party":
+        existing_default = conn.execute(
+            "SELECT 1 FROM rating_events WHERE exchange_id = ? AND rated_party = ? AND rater_role = 'system'",
+            (exchange_id, rated_party),
+        ).fetchone()
+        if existing_default:
+            raise TimeoutAlreadyAppliedError(
+                f"Exchange '{exchange_id}' already has a timeout default for '{rated_party}'; "
+                "the rating window has closed."
+            )
+
     try:
         conn.execute(
             """
-            INSERT INTO rating_events (exchange_id, rater, rated_party, role, category, value, comment, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO rating_events (exchange_id, rater, rated_party, role, category, value, comment, timestamp, rater_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (exchange_id, rater, rated_party, role, category, value, comment, timestamp),
+            (exchange_id, rater, rated_party, role, category, value, comment, timestamp, rater_role),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -308,3 +370,83 @@ def uphold_contest(
         conn.commit()
     except sqlite3.IntegrityError as e:
         raise AlreadyUpheldError(f"Rating event {event_id} has already been upheld") from e
+
+
+def register_exchange(
+    conn: sqlite3.Connection,
+    exchange_id: str,
+    completed_at: str,
+    rating_window_seconds: int,
+    party_a: str,
+    role_a: str,
+    party_b: str,
+    role_b: str,
+) -> None:
+    """Register an exchange's two rating directions and start its rating
+    window (SPEC.md §7): party_b is expected to rate party_a (in role_a),
+    and party_a is expected to rate party_b (in role_b)."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO exchanges (exchange_id, completed_at, rating_window_seconds, party_a, role_a, party_b, role_b)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (exchange_id, completed_at, rating_window_seconds, party_a, role_a, party_b, role_b),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        raise ExchangeAlreadyExistsError(f"Exchange '{exchange_id}' is already registered") from e
+
+
+def get_exchange(conn: sqlite3.Connection, exchange_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM exchanges WHERE exchange_id = ?", (exchange_id,)).fetchone()
+
+
+def apply_timeout_defaults(conn: sqlite3.Connection, exchange_id: str, now: datetime) -> dict:
+    """Backfill a system-attributed +2 (SPEC.md §7) for any direction of
+    `exchange_id` still unrated once its rating window has elapsed.
+
+    Idempotent and safe to call repeatedly — there's no background worker in
+    this API, so a real deployment calls this from an external scheduler
+    (e.g. cron hitting the endpoint that wraps this). A direction that
+    already has any rating at all, real or a prior default, is left alone.
+    """
+    exchange = get_exchange(conn, exchange_id)
+    if exchange is None:
+        raise ExchangeNotFoundError(f"No exchange registered with id '{exchange_id}'")
+
+    completed_at = datetime.fromisoformat(exchange["completed_at"])
+    due_at = completed_at + timedelta(seconds=exchange["rating_window_seconds"])
+    if now < due_at:
+        return {"status": "not_due", "due_at": due_at.isoformat(), "defaulted": []}
+
+    directions = [
+        (exchange["party_a"], exchange["role_a"]),
+        (exchange["party_b"], exchange["role_b"]),
+    ]
+
+    defaulted = []
+    timestamp = now.isoformat()
+    for rated_party, role in directions:
+        already_rated = conn.execute(
+            "SELECT 1 FROM rating_events WHERE exchange_id = ? AND rated_party = ?",
+            (exchange_id, rated_party),
+        ).fetchone()
+        if already_rated:
+            continue
+
+        insert_event(
+            conn,
+            exchange_id=exchange_id,
+            rater="system",
+            rated_party=rated_party,
+            role=role,
+            category=None,
+            value=TIMEOUT_DEFAULT_RATING,
+            comment=None,
+            timestamp=timestamp,
+            rater_role="system",
+        )
+        defaulted.append(rated_party)
+
+    return {"status": "processed", "due_at": due_at.isoformat(), "defaulted": defaulted}
