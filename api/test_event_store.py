@@ -20,6 +20,8 @@ from event_store import (
     EventNotFoundError,
     ExchangeAlreadyExistsError,
     ExchangeNotFoundError,
+    InvalidExchangePartyError,
+    NotRatedPartyError,
     TimeoutAlreadyAppliedError,
     apply_timeout_defaults,
     contest_event,
@@ -309,13 +311,62 @@ def run():
         "double_uphold_rejected",
     )
 
+    # Contest-slot lockout (SPEC.md §5): only the rated party may contest a
+    # rating made against them. Use a FRESH, uncontested event so this proves
+    # a third party can't burn the one-contest-per-event slot on the real
+    # rated party's behalf (not just that a second contest is blocked).
+    insert_event(
+        conn,
+        exchange_id="ex-lockout",
+        rater="frank",
+        rated_party="Bob",
+        role="market_seller",
+        category=None,
+        value=3,
+        comment=None,
+        timestamp="2026-01-15T13:00:00+00:00",
+    )
+    lockout_target_id = next(
+        r["id"] for r in get_events_for_party_role(conn, "Bob", "market_seller")
+        if r["exchange_id"] == "ex-lockout"
+    )
+
+    # "frank" (the rater, not the rated party) tries to contest his own
+    # rating on Bob's behalf — must be rejected.
+    expect_error(
+        lambda: contest_event(
+            conn,
+            event_id=lockout_target_id,
+            contested_by="frank",
+            reason="Third party trying to contest a rating that isn't theirs.",
+            timestamp="2026-01-15T13:30:00+00:00",
+        ),
+        NotRatedPartyError,
+        "third_party_contest_lockout_rejected",
+    )
+
+    # The slot must still be OPEN afterward — Bob, the real rated party, can
+    # still contest it. If the slot had been burned, this would raise
+    # AlreadyContestedError instead of succeeding.
+    contest_event(
+        conn,
+        event_id=lockout_target_id,
+        contested_by="Bob",
+        reason="The real rated party contesting after the lockout attempt failed.",
+        timestamp="2026-01-15T14:00:00+00:00",
+    )
+    lockout_row = next(
+        r for r in get_events_for_party_role(conn, "Bob", "market_seller") if r["id"] == lockout_target_id
+    )
+    assert lockout_row["contested_by"] == "Bob", "the rated party's own contest must succeed"
+
     # Contesting an already-dismissed event is rejected — nothing left to
     # contest once an adjudicator already ruled it out entirely.
     expect_error(
         lambda: contest_event(
             conn,
             event_id=dismissed_event_id,
-            contested_by="alice",
+            contested_by="Bob",
             reason="trying to contest a dismissed event",
             timestamp="2026-01-16T00:00:00+00:00",
         ),
@@ -491,6 +542,102 @@ def run():
     assert len(seller_rows_partial) == 1
     assert seller_rows_partial[0]["value"] == 4, "the real rating must stand, untouched by the timeout pass"
     assert seller_rows_partial[0]["rater_role"] == "party"
+
+    # Ratings tied to their registered exchange (SPEC.md §7): once an exchange
+    # is registered, (rater, rated_party) must match one of its two actual
+    # directions — a third party can't rate on an exchange they weren't part
+    # of, and self-rating is blocked as a side effect.
+    register_exchange(
+        conn,
+        exchange_id="tx-tied",
+        completed_at="2026-04-01T00:00:00+00:00",
+        rating_window_seconds=3600,
+        party_a="TiedSeller",
+        role_a="market_seller",
+        party_b="TiedBuyer",
+        role_b="market_buyer",
+    )
+
+    # An outsider (not party_a or party_b on this exchange) rating either
+    # party is rejected.
+    expect_error(
+        lambda: insert_event(
+            conn,
+            exchange_id="tx-tied",
+            rater="RandomOutsider",
+            rated_party="TiedSeller",
+            role="market_seller",
+            category=None,
+            value=2,
+            comment=None,
+            timestamp="2026-04-01T00:10:00+00:00",
+            rater_role="party",
+        ),
+        InvalidExchangePartyError,
+        "outsider_rating_rejected",
+    )
+
+    # Self-rating on this exchange (party_a "rating" party_a) is rejected the
+    # same way — it's not one of the two registered directions.
+    expect_error(
+        lambda: insert_event(
+            conn,
+            exchange_id="tx-tied",
+            rater="TiedSeller",
+            rated_party="TiedSeller",
+            role="market_seller",
+            category=None,
+            value=4,
+            comment=None,
+            timestamp="2026-04-01T00:11:00+00:00",
+            rater_role="party",
+        ),
+        InvalidExchangePartyError,
+        "self_rating_rejected",
+    )
+
+    # The two actual directions still work.
+    insert_event(
+        conn,
+        exchange_id="tx-tied",
+        rater="TiedBuyer",
+        rated_party="TiedSeller",
+        role="market_seller",
+        category=None,
+        value=3,
+        comment=None,
+        timestamp="2026-04-01T00:12:00+00:00",
+        rater_role="party",
+    )
+    insert_event(
+        conn,
+        exchange_id="tx-tied",
+        rater="TiedSeller",
+        rated_party="TiedBuyer",
+        role="market_buyer",
+        category=None,
+        value=3,
+        comment=None,
+        timestamp="2026-04-01T00:13:00+00:00",
+        rater_role="party",
+    )
+    assert len(get_events_for_party_role(conn, "TiedSeller", "market_seller")) == 1
+    assert len(get_events_for_party_role(conn, "TiedBuyer", "market_buyer")) == 1
+
+    # Unregistered exchanges keep the prior permissive behavior — no exchange
+    # row means nothing to validate the direction against.
+    insert_event(
+        conn,
+        exchange_id="tx-unregistered",
+        rater="AnyoneAtAll",
+        rated_party="TiedSeller",
+        role="market_seller",
+        category=None,
+        value=1,
+        comment=None,
+        timestamp="2026-04-01T00:14:00+00:00",
+        rater_role="party",
+    )
 
     conn.close()
     print("ALL TESTS PASSED")

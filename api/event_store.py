@@ -61,6 +61,26 @@ class AlreadyContestedError(Exception):
     one open contest per event)."""
 
 
+class NotRatedPartyError(Exception):
+    """Raised when contested_by doesn't match the event's rated_party.
+
+    SPEC.md §5 grants the contest right to "any rated party" contesting "a
+    rating made against them" — not to arbitrary third parties. Without this
+    check, anyone could burn the one-contest-per-event slot with a junk
+    reason and permanently lock the real rated party out (an uphold then
+    cements it). Identity is still self-asserted until writes are
+    authenticated, but this at least encodes the spec's semantic.
+    """
+
+
+class InvalidExchangePartyError(Exception):
+    """Raised when a rating's (rater, rated_party) doesn't match either of a
+    registered exchange's two directions (SPEC.md §7's party_a/party_b).
+    Unregistered exchanges skip this check and keep the prior permissive
+    behavior — this only applies once an exchange has been registered.
+    """
+
+
 class ContestNotFoundError(Exception):
     """Raised when an uphold references an event with no contest on record."""
 
@@ -199,6 +219,12 @@ def insert_event(
     # default and the late rating in the same distribution). The system's
     # own default insert (rater_role="system") skips this check — it's the
     # one thing allowed to occupy that slot when nothing else has.
+    #
+    # NOTE: this is check-then-insert against a fresh connection per call, not
+    # inside a transaction — two concurrent requests for the same direction
+    # could both pass this check before either commits. Not addressed here
+    # (fine at this scale); a real fix would wrap the check+insert in
+    # `BEGIN IMMEDIATE` to serialize it.
     if rater_role == "party":
         existing_default = conn.execute(
             "SELECT 1 FROM rating_events WHERE exchange_id = ? AND rated_party = ? AND rater_role = 'system'",
@@ -209,6 +235,21 @@ def insert_event(
                 f"Exchange '{exchange_id}' already has a timeout default for '{rated_party}'; "
                 "the rating window has closed."
             )
+
+        # SPEC.md §7: once an exchange is registered, a rating must come from
+        # one of its two actual directions. Unregistered exchanges are left
+        # permissive (this API doesn't require registration before rating).
+        exchange = get_exchange(conn, exchange_id)
+        if exchange is not None:
+            valid_directions = {
+                (exchange["party_a"], exchange["party_b"]),
+                (exchange["party_b"], exchange["party_a"]),
+            }
+            if (rater, rated_party) not in valid_directions:
+                raise InvalidExchangePartyError(
+                    f"'{rater}' rating '{rated_party}' doesn't match either registered direction "
+                    f"for exchange '{exchange_id}'"
+                )
 
     try:
         conn.execute(
@@ -320,13 +361,20 @@ def contest_event(
     timestamp: str,
 ) -> None:
     """Record that the rated party is contesting a rating made against them
-    (SPEC.md §5). Symmetric by construction: this takes whatever event_id is
-    given, with no check on which "side" is contesting — the covenant runs
-    both ways, and the API encodes no privileged direction. One open contest
-    per event."""
-    row = conn.execute("SELECT id FROM rating_events WHERE id = ?", (event_id,)).fetchone()
+    (SPEC.md §5). Symmetric by construction: this doesn't care which "side"
+    (producer or consumer, buyer or seller) the rated_party happens to be —
+    the covenant runs both ways, no privileged direction — but it does
+    require contested_by to actually BE that event's rated_party. One open
+    contest per event."""
+    row = conn.execute("SELECT id, rated_party FROM rating_events WHERE id = ?", (event_id,)).fetchone()
     if row is None:
         raise EventNotFoundError(f"No rating event with id {event_id}")
+
+    if contested_by != row["rated_party"]:
+        raise NotRatedPartyError(
+            f"Only the rated party ('{row['rated_party']}') may contest rating event {event_id}, "
+            f"not '{contested_by}'"
+        )
 
     if _is_dismissed(conn, event_id):
         raise AlreadyDismissedError(
@@ -428,6 +476,9 @@ def apply_timeout_defaults(conn: sqlite3.Connection, exchange_id: str, now: date
     defaulted = []
     timestamp = now.isoformat()
     for rated_party, role in directions:
+        # Same check-then-insert race noted in insert_event: two concurrent
+        # apply-timeouts calls (or one racing a late real submission) could
+        # both see "not yet rated" before either writes. Not addressed here.
         already_rated = conn.execute(
             "SELECT 1 FROM rating_events WHERE exchange_id = ? AND rated_party = ?",
             (exchange_id, rated_party),

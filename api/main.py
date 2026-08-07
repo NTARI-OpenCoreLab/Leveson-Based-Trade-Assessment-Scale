@@ -138,7 +138,9 @@ class ExchangeRegistration(BaseModel):
         None, description="ISO-8601 completion time; defaults to now if omitted"
     )
     rating_window_seconds: Optional[int] = Field(
-        None, description=f"Rating window before a timeout default applies; defaults to {DEFAULT_RATING_WINDOW_SECONDS}s (7 days)"
+        None,
+        gt=0,
+        description=f"Rating window before a timeout default applies; defaults to {DEFAULT_RATING_WINDOW_SECONDS}s (7 days). Must be positive.",
     )
 
 
@@ -176,6 +178,8 @@ def submit_rating(submission: RatingSubmission) -> dict:
         )
     except (event_store.DuplicateRatingError, event_store.TimeoutAlreadyAppliedError) as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except event_store.InvalidExchangePartyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
 
@@ -233,6 +237,8 @@ def contest_rating(event_id: int, contest: ContestRequest) -> dict:
         )
     except event_store.EventNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except event_store.NotRatedPartyError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except (event_store.AlreadyDismissedError, event_store.AlreadyContestedError) as e:
         raise HTTPException(status_code=409, detail=str(e))
     finally:
@@ -283,9 +289,34 @@ def uphold_rating(event_id: int, uphold: UpholdRequest) -> dict:
 @app.post("/exchanges", status_code=201)
 def register_exchange(exchange: ExchangeRegistration) -> dict:
     """Register an exchange's two rating directions and start its rating
-    window (SPEC.md §7). Ungated, same posture as POST /ratings."""
-    completed_at = exchange.completed_at or datetime.now(timezone.utc).isoformat()
-    rating_window_seconds = exchange.rating_window_seconds or DEFAULT_RATING_WINDOW_SECONDS
+    window (SPEC.md §7). Ungated, same posture as POST /ratings.
+
+    completed_at is parsed and required to be timezone-aware here: stored
+    unparsed, a malformed or naive value would surface later as a 500 inside
+    apply_timeout_defaults's datetime arithmetic instead of a clean 400 now.
+    """
+    if exchange.completed_at is not None:
+        try:
+            parsed_completed_at = datetime.fromisoformat(exchange.completed_at)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="completed_at must be a valid ISO-8601 datetime"
+            )
+        if parsed_completed_at.tzinfo is None:
+            raise HTTPException(
+                status_code=400,
+                detail="completed_at must be timezone-aware (include a UTC offset, e.g. '+00:00' or 'Z')",
+            )
+        completed_at = exchange.completed_at
+    else:
+        completed_at = datetime.now(timezone.utc).isoformat()
+
+    # gt=0 on the model already rejects 0/negative; None means "use the default".
+    rating_window_seconds = (
+        exchange.rating_window_seconds
+        if exchange.rating_window_seconds is not None
+        else DEFAULT_RATING_WINDOW_SECONDS
+    )
 
     conn = event_store.get_connection()
     try:
