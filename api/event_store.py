@@ -74,10 +74,13 @@ class NotRatedPartyError(Exception):
 
 
 class InvalidExchangePartyError(Exception):
-    """Raised when a rating's (rater, rated_party) doesn't match either of a
-    registered exchange's two directions (SPEC.md §7's party_a/party_b).
-    Unregistered exchanges skip this check and keep the prior permissive
-    behavior — this only applies once an exchange has been registered.
+    """Raised when a rating's (rater, rated_party, role) doesn't match either
+    of a registered exchange's two directions (SPEC.md §7's
+    party_a/role_a/party_b/role_b) — role is pinned too, not just the party
+    pair, so a real pair can't slip through under the wrong role and misfile
+    into the wrong §3 bucket. Unregistered exchanges skip this check and keep
+    the prior permissive behavior — this only applies once an exchange has
+    been registered.
     """
 
 
@@ -237,18 +240,22 @@ def insert_event(
             )
 
         # SPEC.md §7: once an exchange is registered, a rating must come from
-        # one of its two actual directions. Unregistered exchanges are left
-        # permissive (this API doesn't require registration before rating).
+        # one of its two actual directions, IN the role that direction is
+        # actually registered under — pinning (rater, rated_party) alone
+        # would let a real pair through under the wrong role and misfile it
+        # into the wrong bucket, the same §3 mixup this check exists to
+        # prevent. Unregistered exchanges are left permissive (this API
+        # doesn't require registration before rating).
         exchange = get_exchange(conn, exchange_id)
         if exchange is not None:
             valid_directions = {
-                (exchange["party_a"], exchange["party_b"]),
-                (exchange["party_b"], exchange["party_a"]),
+                (exchange["party_b"], exchange["party_a"], exchange["role_a"]),
+                (exchange["party_a"], exchange["party_b"], exchange["role_b"]),
             }
-            if (rater, rated_party) not in valid_directions:
+            if (rater, rated_party, role) not in valid_directions:
                 raise InvalidExchangePartyError(
-                    f"'{rater}' rating '{rated_party}' doesn't match either registered direction "
-                    f"for exchange '{exchange_id}'"
+                    f"'{rater}' rating '{rated_party}' as '{role}' doesn't match either registered "
+                    f"direction for exchange '{exchange_id}'"
                 )
 
     try:

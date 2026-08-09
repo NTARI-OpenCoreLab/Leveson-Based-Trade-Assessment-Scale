@@ -624,6 +624,29 @@ def run():
     assert len(get_events_for_party_role(conn, "TiedSeller", "market_seller")) == 1
     assert len(get_events_for_party_role(conn, "TiedBuyer", "market_buyer")) == 1
 
+    # A real, registered pair under the WRONG role is rejected too — pinning
+    # (rater, rated_party) alone would let this through and misfile it into a
+    # role TiedSeller never actually acted in on this exchange (the same §3
+    # mixup the direction check exists to prevent).
+    expect_error(
+        lambda: insert_event(
+            conn,
+            exchange_id="tx-tied",
+            rater="TiedBuyer",
+            rated_party="TiedSeller",
+            role="market_buyer",
+            category=None,
+            value=2,
+            comment=None,
+            timestamp="2026-04-01T00:13:30+00:00",
+            rater_role="party",
+        ),
+        InvalidExchangePartyError,
+        "wrong_role_for_registered_direction_rejected",
+    )
+    # And it must not have snuck into the wrong bucket either.
+    assert len(get_events_for_party_role(conn, "TiedSeller", "market_buyer")) == 0
+
     # Unregistered exchanges keep the prior permissive behavior — no exchange
     # row means nothing to validate the direction against.
     insert_event(
