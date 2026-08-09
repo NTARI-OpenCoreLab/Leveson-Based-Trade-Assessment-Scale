@@ -44,6 +44,8 @@ coverage.xml
 *.json
 lbtas_ratings.json
 ratings.json
+*.db
+lbtas_events.db
 
 # Virtual environments
 venv/
