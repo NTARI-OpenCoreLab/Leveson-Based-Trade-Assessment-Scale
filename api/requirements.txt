@@ -10,6 +10,9 @@ uvicorn[standard]>=0.20.0
 #   cd api && python3 test_rating_validation.py
 #   cd api && python3 test_event_store.py
 #
-# Reads require an API key (fails closed otherwise):
-#   LBTAS_API_KEY=<your-key> uvicorn api.main:app --reload
-#   curl -H "X-API-Key: <your-key>" http://localhost:8000/ratings/<party>/<role>
+# Reads/dismiss/uphold/apply-timeouts require LBTAS_API_KEY; submissions
+# (POST /ratings, /contest, /exchanges) require a SEPARATE LBTAS_SUBMIT_KEY —
+# CLAUDE.md treats them as distinct capabilities. Both fail closed if unset:
+#   LBTAS_API_KEY=<read-key> LBTAS_SUBMIT_KEY=<submit-key> uvicorn api.main:app --reload
+#   curl -H "X-API-Key: <read-key>" http://localhost:8000/ratings/<party>/<role>
+#   curl -X POST -H "X-API-Key: <submit-key>" http://localhost:8000/ratings -d '...'

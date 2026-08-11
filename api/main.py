@@ -16,12 +16,16 @@ contaminate another role's distribution.
 Events persist to a local SQLite file (api/event_store.py) so ratings survive
 a restart, per CLAUDE.md's "Storing ratings locally" requirement.
 
-Reads are gated behind LBTAS_API_KEY (see require_api_key below) so an
-unconfigured deployment fails closed, per CLAUDE.md's authorization section.
-Writes are not yet gated — CLAUDE.md treats submission and review as separate
-capabilities, and only the read side was flagged as unauthorized in review;
-gating submission is a separate, not-yet-built piece. Running this on
-NTARIHQ is likewise separate.
+CLAUDE.md's authorization section treats submission and review as separate
+capabilities that "must be authorized separately." Two keys, two gates:
+LBTAS_API_KEY (require_api_key) covers the review/adjudication side — reads,
+dismiss, uphold, apply-timeouts. LBTAS_SUBMIT_KEY (require_submit_key) covers
+the submission side — POST /ratings, /contest, /exchanges. Both fail closed
+(503) with no key configured, never falling open. This is still coarse
+compared to CLAUDE.md's fuller model — one shared secret per capability, not
+a credential scoped to a specific party or tied to a specific served prompt —
+but it does now encode "these are different capabilities" as two actually
+different secrets, not just a comment saying so.
 
 POST /ratings/{event_id}/dismiss lets an adjudicator dismiss a bad-faith
 rating (SPEC.md §4, §6): the dismissal is its own append-only annotation,
@@ -34,20 +38,21 @@ as reads, which is coarser than SPEC.md's "operator-local adjudicator role."
 
 POST /ratings/{event_id}/contest lets the rated party dispute a rating made
 against them, in either direction (SPEC.md §5 — the covenant is symmetric,
-no privileged side); it is ungated, like POST /ratings, since it's the rated
-party exercising their own right rather than a privileged review. POST
-/ratings/{event_id}/uphold is the adjudicator's other resolution besides
-dismissal: the rating stands, but GET marks it "contested" and "upheld" (with
-who and why) rather than silently leaving it looking unquestioned.
+no privileged side); it's gated behind LBTAS_SUBMIT_KEY like POST /ratings,
+since it's the rated party exercising their own right, not a privileged
+review. POST /ratings/{event_id}/uphold is the adjudicator's other
+resolution besides dismissal: the rating stands, but GET marks it
+"contested" and "upheld" (with who and why) rather than silently leaving it
+looking unquestioned.
 
 POST /exchanges registers an exchange's two rating directions and starts its
-rating window (SPEC.md §7); ungated, same posture as POST /ratings. POST
-/exchanges/{exchange_id}/apply-timeouts backfills a system-attributed +2 for
-any direction still unrated once the window has elapsed — there's no
-background worker here, so a real deployment calls this from an external
-scheduler. It's gated behind LBTAS_API_KEY, same as dismiss/uphold. GET marks
-a timeout default as "defaulted" so it's never mistaken for an affirmed
-rating, and surfaces a party/role's defaulted_count.
+rating window (SPEC.md §7); gated behind LBTAS_SUBMIT_KEY, same posture as
+POST /ratings. POST /exchanges/{exchange_id}/apply-timeouts backfills a
+system-attributed +2 for any direction still unrated once the window has
+elapsed — there's no background worker here, so a real deployment calls this
+from an external scheduler. It's gated behind LBTAS_API_KEY, same as
+dismiss/uphold. GET marks a timeout default as "defaulted" so it's never
+mistaken for an affirmed rating, and surfaces a party/role's defaulted_count.
 
 Copyright (C) 2024 Network Theory Applied Research Institute
 Licensed under GNU Affero General Public License v3.0
@@ -72,21 +77,39 @@ from .rating_validation import RatingValidationError, validate_rating_submission
 app = FastAPI(title="LBTAS API", version="2.0.0")
 
 API_KEY_ENV_VAR = "LBTAS_API_KEY"
+SUBMIT_KEY_ENV_VAR = "LBTAS_SUBMIT_KEY"
 DEFAULT_RATING_WINDOW_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 
-def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
-    """Fail-closed read gate: with no key configured, every read is denied —
-    never falls open. Compares with secrets.compare_digest to avoid a timing
-    side-channel on the key check."""
-    configured_key = os.environ.get(API_KEY_ENV_VAR)
+def _require_key(env_var: str, x_api_key: Optional[str], unavailable_detail: str) -> None:
+    """Shared fail-closed check: with no key configured, deny everything —
+    never fall open. secrets.compare_digest avoids a timing side-channel."""
+    configured_key = os.environ.get(env_var)
     if not configured_key:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Reads are not available: {API_KEY_ENV_VAR} is not configured on this deployment.",
-        )
+        raise HTTPException(status_code=503, detail=unavailable_detail)
     if not x_api_key or not secrets.compare_digest(x_api_key, configured_key):
         raise HTTPException(status_code=401, detail="Missing or invalid API key.")
+
+
+def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
+    """Review/adjudication gate: reads, dismiss, uphold, apply-timeouts."""
+    _require_key(
+        API_KEY_ENV_VAR,
+        x_api_key,
+        f"Reads are not available: {API_KEY_ENV_VAR} is not configured on this deployment.",
+    )
+
+
+def require_submit_key(x_api_key: Optional[str] = Header(None)) -> None:
+    """Submission gate: POST /ratings, /contest, /exchanges. Deliberately a
+    separate secret from require_api_key — CLAUDE.md: submitting a rating and
+    reviewing accumulated records "are distinct capabilities and must be
+    authorized separately." """
+    _require_key(
+        SUBMIT_KEY_ENV_VAR,
+        x_api_key,
+        f"Submissions are not available: {SUBMIT_KEY_ENV_VAR} is not configured on this deployment.",
+    )
 
 
 class RatingSubmission(BaseModel):
@@ -153,7 +176,7 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/ratings", status_code=201)
+@app.post("/ratings", status_code=201, dependencies=[Depends(require_submit_key)])
 def submit_rating(submission: RatingSubmission) -> dict:
     try:
         validate_rating_submission(submission.value, submission.comment)
@@ -218,12 +241,11 @@ def dismiss_rating(event_id: int, dismissal: DismissalRequest) -> dict:
     }
 
 
-@app.post("/ratings/{event_id}/contest")
+@app.post("/ratings/{event_id}/contest", dependencies=[Depends(require_submit_key)])
 def contest_rating(event_id: int, contest: ContestRequest) -> dict:
     """The rated party disputes a rating made against them (SPEC.md §5).
-    Ungated, unlike dismiss/uphold: this is the rated party's own right, not
-    an adjudicator action — same posture as POST /ratings, which is also not
-    yet gated behind per-party auth."""
+    Gated behind LBTAS_SUBMIT_KEY like POST /ratings, not LBTAS_API_KEY:
+    this is the rated party's own right, not an adjudicator action."""
     timestamp = datetime.now(timezone.utc).isoformat()
 
     conn = event_store.get_connection()
@@ -286,10 +308,11 @@ def uphold_rating(event_id: int, uphold: UpholdRequest) -> dict:
     }
 
 
-@app.post("/exchanges", status_code=201)
+@app.post("/exchanges", status_code=201, dependencies=[Depends(require_submit_key)])
 def register_exchange(exchange: ExchangeRegistration) -> dict:
     """Register an exchange's two rating directions and start its rating
-    window (SPEC.md §7). Ungated, same posture as POST /ratings.
+    window (SPEC.md §7). Gated behind LBTAS_SUBMIT_KEY, same posture as
+    POST /ratings.
 
     completed_at is parsed and required to be timezone-aware here: stored
     unparsed, a malformed or naive value would surface later as a 500 inside
