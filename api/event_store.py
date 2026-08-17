@@ -216,7 +216,10 @@ def insert_event(
     comment: Optional[str],
     timestamp: str,
     rater_role: str = "party",
-) -> None:
+) -> int:
+    """Insert a rating event and return its new id — callers (e.g. the API's
+    submit endpoint) need it to dismiss/contest this exact event later; there
+    was previously no way to get it back short of a follow-up read."""
     # SPEC.md §7: a real ("party") rating arriving after a timeout default
     # already filled this exact direction would double-count it (both the
     # default and the late rating in the same distribution). The system's
@@ -259,7 +262,7 @@ def insert_event(
                 )
 
     try:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO rating_events (exchange_id, rater, rated_party, role, category, value, comment, timestamp, rater_role)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -267,6 +270,7 @@ def insert_event(
             (exchange_id, rater, rated_party, role, category, value, comment, timestamp, rater_role),
         )
         conn.commit()
+        return cursor.lastrowid
     except sqlite3.IntegrityError as e:
         if "UNIQUE constraint failed" in str(e):
             raise DuplicateRatingError(

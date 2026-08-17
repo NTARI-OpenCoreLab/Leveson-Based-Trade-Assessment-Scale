@@ -6,9 +6,13 @@ uvicorn[standard]>=0.20.0
 # relative imports:
 #   uvicorn api.main:app --reload
 #
-# Run the tests from INSIDE this directory (they use bare imports):
+# Run the store/validation tests from INSIDE this directory (bare imports):
 #   cd api && python3 test_rating_validation.py
 #   cd api && python3 test_event_store.py
+#
+# test_main.py drives the actual HTTP layer (real uvicorn subprocess, temp
+# DB, stdlib urllib — no extra dependency). Run from the REPO ROOT instead:
+#   python3 api/test_main.py
 #
 # Reads/dismiss/uphold/apply-timeouts require LBTAS_API_KEY; submissions
 # (POST /ratings, /contest, /exchanges) require a SEPARATE LBTAS_SUBMIT_KEY —

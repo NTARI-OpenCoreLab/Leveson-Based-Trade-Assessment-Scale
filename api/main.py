@@ -188,7 +188,7 @@ def submit_rating(submission: RatingSubmission) -> dict:
 
     conn = event_store.get_connection()
     try:
-        event_store.insert_event(
+        event_id = event_store.insert_event(
             conn,
             exchange_id=event["exchange_id"],
             rater=event["rater"],
@@ -206,7 +206,9 @@ def submit_rating(submission: RatingSubmission) -> dict:
     finally:
         conn.close()
 
-    return {"status": "accepted", "submission": event}
+    # event_id lets the caller dismiss/contest this exact event later without
+    # a follow-up GET just to look up its id.
+    return {"status": "accepted", "event_id": event_id, "submission": event}
 
 
 @app.post("/ratings/{event_id}/dismiss", dependencies=[Depends(require_api_key)])
