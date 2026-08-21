@@ -5,6 +5,45 @@ All notable changes to LBTAS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A working networked API implementation now exists under `api/` (FastAPI +
+SQLite, no other external dependencies) — the production surface `CLAUDE.md`
+describes, previously undocumented anywhere but the spec. Not yet deployed to
+NTARIHQ. See `api/requirements.txt` for run/test instructions and
+`api/main.py`'s module docstring for exactly what's implemented versus still
+coarse.
+
+### Added
+
+- **Rating submission and role-scoped reads** (`POST /ratings`,
+  `GET /ratings/{party}/{role}`), backed by an individual-event SQLite store
+  (not the CLI's JSON file) per `CLAUDE.md`'s data model.
+- **The `-1` comment rule** enforced at the API boundary: mandatory,
+  ≤500 words and a byte ceiling, rejected rather than truncated.
+- **Dismiss-as-annotate, symmetric contest/uphold, and timeout defaults**
+  (`SPEC.md` §4–§7): a bad-faith rating can be dismissed without erasing it;
+  a rated party can contest a rating against them and have it upheld or
+  dismissed; an exchange left unrated past its window gets a
+  system-attributed `+2`, always distinguishable from an affirmed rating.
+- **Two independent auth keys** (`LBTAS_API_KEY` for reads/adjudication,
+  `LBTAS_SUBMIT_KEY` for submission), both failing closed with none
+  configured, per `CLAUDE.md`'s "submission and review are distinct
+  capabilities" rule.
+- **Three test suites** (`api/test_rating_validation.py`,
+  `api/test_event_store.py`, `api/test_main.py`) — the last spins up a real
+  server against a temp database to cover the HTTP/auth layer end to end.
+
+### Known limitations
+
+- Auth is one shared secret per capability, not a credential scoped to a
+  specific party or a specific served prompt.
+- No trigger mechanism yet: nothing fires a rating prompt automatically off
+  a transaction event; submission is direct only.
+- Role-scoping is implemented in `api/` but not yet in the four reference
+  CLIs (tracked separately in `CONFORMANCE.md`) — doing so would require
+  changing the CLI's frozen JSON storage shape, which is out of scope here.
+
 ## [2.0.0] - 2026-06-28
 
 Distribution release. **Breaking change to the read API:** ratings are no
