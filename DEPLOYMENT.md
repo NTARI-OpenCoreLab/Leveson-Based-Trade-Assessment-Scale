@@ -6,10 +6,14 @@ plus the total; ratings are never averaged. `CLAUDE.md` is the source of truth
 for the model and the production API; this guide is operational only.
 
 The repository at `NTARI-RAND/Leveson-Based-Trade-Assessment-Scale` ships four
-behaviourally identical reference CLIs. The production surface is a networked API
-served on the **NTARIHQ** machine (see `CLAUDE.md` → *What the API does*); the
-API service itself is not yet in this repository, so the steps below cover the
-reference implementations.
+behaviourally identical reference CLIs, plus a working networked API
+implementation under `api/` (FastAPI + SQLite). The production surface is
+meant to run on the **NTARIHQ** machine (see `CLAUDE.md` → *What the API
+does*); `api/` is not yet deployed there, and some of CLAUDE.md's model is
+still coarser than the full spec (per-capability auth rather than per-party,
+no automatic trigger mechanism) — see `api/main.py`'s module docstring for
+exactly what's implemented. The steps below cover the reference CLIs; see
+`api/requirements.txt` for the API's own build/run/test instructions.
 
 ---
 
@@ -25,6 +29,10 @@ reference implementations.
 `LICENSE` is the canonical AGPL-3.0 text. `CHANGELOG.md` records the release
 history. The CLI JSON storage shape (`exchange → { category: [int…], _metadata }`)
 is shared across all four implementations.
+
+The networked API (`api/main.py`, `api/event_store.py`, `api/rating_validation.py`)
+is a separate implementation with its own event-per-rating SQLite store — it
+does not read or write the CLI's JSON files. See `api/requirements.txt`.
 
 ---
 
@@ -62,6 +70,14 @@ Smoke test that no implementation averages: a dataset of `20×(-1)` and
 `5000×(+3)` on one category must render `-1: 20` and `+3: 5000` with
 `total: 5020`, and `report` must list that exchange under `harm_flagged` with a
 count of `20`.
+
+### API
+```bash
+pip install -r api/requirements.txt
+cd api && python3 test_rating_validation.py && python3 test_event_store.py && cd ..
+python3 api/test_main.py              # spins up a real server against a temp DB
+LBTAS_API_KEY=<key> LBTAS_SUBMIT_KEY=<key> uvicorn api.main:app --reload
+```
 
 ---
 

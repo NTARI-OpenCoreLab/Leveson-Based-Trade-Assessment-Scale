@@ -169,6 +169,25 @@ Default categories:
 
 Custom categories can be defined during initialization.
 
+## Networked API (`api/`)
+
+Beyond the four reference CLIs above, this repo also ships a working
+networked API under `api/` (FastAPI + SQLite, no other external
+dependencies) — the production surface `CLAUDE.md` describes. It has its own
+event-per-rating store, separate from the CLI's JSON file, and implements:
+
+- Rating submission and role-scoped reads
+- The `-1` comment rule (mandatory, ≤500 words, rejected rather than truncated)
+- Dismiss-as-annotate, symmetric contest/uphold, and timeout defaults
+  (`SPEC.md` §4–§7)
+- Two separate auth keys gating submission vs. review, per CLAUDE.md's
+  "distinct capabilities" rule
+
+See `api/requirements.txt` for run/test commands and `api/main.py`'s module
+docstring for what's implemented versus still coarse (auth is per-capability
+rather than per-party; there's no automatic trigger mechanism yet). It is not
+yet deployed to the NTARIHQ machine.
+
 ## Use Cases
 
 ### Academic Research
