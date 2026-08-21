@@ -14,8 +14,11 @@ the HTTP wiring on top of that — status codes, the two-key auth gating, and
 response shapes — which had previously only ever been checked by hand with
 curl.
 
-Run directly with `python3 api/test_main.py` from inside the api/ directory
-(matches the other test files' run convention).
+Run from the REPO ROOT: `python3 api/test_main.py` (matches requirements.txt;
+unlike the other two test files, this one doesn't need to run from inside
+api/ — it has no sibling-module imports, and the uvicorn subprocess's cwd is
+pinned to the repo root explicitly regardless of where this script is invoked
+from).
 
 Copyright (C) 2024 Network Theory Applied Research Institute
 Licensed under GNU Affero General Public License v3.0
@@ -36,7 +39,8 @@ import urllib.error
 import urllib.request
 
 HOST = "127.0.0.1"
-PORT = 8934
+# Overridable in case 8934 is ever busy on the machine running this.
+PORT = int(os.environ.get("LBTAS_TEST_PORT", "8934"))
 BASE_URL = f"http://{HOST}:{PORT}"
 READ_KEY = "test-read-key"
 SUBMIT_KEY = "test-submit-key"
